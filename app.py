@@ -1,122 +1,185 @@
+import traceback
 import cv2
 import numpy as np
 import base64
 from ultralytics import YOLO
-import math
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
+import torch
+
+# 👇 新增 LINE 與 Firebase 的套件
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import firebase_admin
+from firebase_admin import credentials, firestore
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-# --- 1. 擴充版食材清單 (加入精準肉類描述) ---
-# 秘訣：使用 "Raw" (生的), "Sliced" (切片的), "Packaged" (包裝好的) 來引導 AI 尋找超市肉類，而非活體動物。
+# ==========================================
+# 1. LINE Bot 與 Firebase 初始化設定
+# ==========================================
+# ⚠️ 請換成你在 LINE Developers > Messaging API 拿到的金鑰
+line_bot_api = LineBotApi('a9uZGfT+NPtcD0zi/7hQr7Oh1RnZgY4qPombJyhhGasT7v8Ki5isp1x4PfMk3ap5wVybz1B4QVsy4g4WwnYuHNRjM0q9cNAauYiE7vBl6iRpu+EB6DBxq7TwWWV6DHfXRkTN2YTkFI5eo905ChYjFwdB04t89/1O/w1cDnyilFU=')
+handler = WebhookHandler('7738c0704ea63f77dcd8d9ece7924773')
+
+# 初始化 Firebase Admin (讀取剛剛下載的 JSON 鑰匙)
+cred = credentials.Certificate("serviceAccountKey.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# --- 1. 官方模型絕對不能改的 80 個順序 (確保對位準確) ---
 custom_food_list = [
-    # 蔬菜與水果 (保留原有)
-    "Cabbage", "Chinese Cabbage", "Bok Choy", "Spinach", "Water Spinach", "Sweet Potato Leaves", "A-Choy", "Basil", 
-    "Green Onion", "Whole Garlic Bulb", "Ginger", "Chili", "Onion", "Green Pepper", "Bell Pepper", "Cucumber", "Sponge Gourd", 
-    "Bitter Gourd", "Winter Melon", "Pumpkin", "Zucchini", "Eggplant", "Tomato", "Okra", "Corn", "Baby Corn", 
-    "Carrot", "White Radish", "Potato", "Sweet Potato", "Taro", "Bamboo Shoot", "Water Bamboo", "Asparagus", 
-    "Bean Sprout", "Green Bean", "Edamame", "Shiitake", "Enoki Mushroom", "King Oyster Mushroom", "Broccoli",
-    "Red Apple", "Banana", "Pineapple", "Papaya", "Watermelon", "Melon", "Grape", "Strawberry", "Orange", "Tangerine", 
-    "Lemon", "Passion Fruit", "Mango", "Guava", "Pear", "Dragon Fruit", "Kiwi", "Peach", "Cherry",
-    
-    # 🔥 優化後的肉類清單 (多重描述增加命中率)
-    "Raw pork meat", "Packaged raw pork", "Raw pork belly slice", "Raw pork chop", 
-    "Sausage", "Bacon", "Ham", 
-    "Raw beef meat", "Raw beef steak", "Sliced raw beef", "Packaged raw beef","Meat", "Beef slice", "Red meat",
-    "Raw chicken meat", "Raw chicken breast", "Raw chicken leg", "Raw chicken wing", 
-    "Raw salmon fillet", "Raw tuna fillet", "Raw cod fish", "Raw mackerel", "Raw tilapia fish", 
-    "Raw shrimp", "Raw clam", "Raw oyster",
-    
-    # 主食、烘焙與調味 (保留原有)
-    "Rice", "Noodle", "Pasta", "Toast", "Bread", "Bun", "Dumpling", "Egg", "Tofu", "Dried Tofu", 
-    "Bean Curd Skin", "Milk", "Soy Milk", "Oat Milk", "Yogurt", "Cheese", "Butter", "Soy Sauce", "Ketchup", "Kimchi",
-    "Flour", "Sugar", "Yeast", "Baking Powder", "Vanilla Extract", "Chocolate", "Whipping Cream", "Cream Cheese", "Almond Flour", "Matcha Powder",
-    "Sesame Oil", "Oyster Sauce", "Rice Wine", "Star Anise", "Wood Ear Mushroom", "Dried Shrimp", "Scallop", "Fermented Black Beans", "Doubanjiang",
-    "Tuna can", "Kimchi can", "Spam", "Ham slice", "Bacon slice",
-    "Coke", "Pepsi", "Milk tea", "Oolong tea", "Green tea",
-    "Udon noodle", "Ramen", "Instant noodle", "Pasta",
-    "Strawberry", "Blueberry", "Cherry", "Grapes",
-    "Sausage", "Hot dog", "Chicken nugget", "Fish ball"
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed",
+    "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
+    "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
 ]
 
-# --- 2. 食材英翻中字典 (多對一映射) ---
+# --- 2. 專題專用翻譯字典 (我們只翻譯食物，其他的當作沒看到) ---
 translation_dict = {
-    # 蔬菜與水果
-    "Cabbage": "高麗菜", "Chinese Cabbage": "大白菜", "Bok Choy": "小白菜", "Spinach": "菠菜", "Water Spinach": "空心菜", 
-    "Sweet Potato Leaves": "地瓜葉", "A-Choy": "A菜", "Basil": "九層塔", "Green Onion": "青蔥", "Whole Garlic Bulb": "蒜頭", 
-    "Ginger": "薑", "Chili": "辣椒", "Onion": "洋蔥", "Green Pepper": "青椒", "Bell Pepper": "甜椒", "Cucumber": "小黃瓜", 
-    "Sponge Gourd": "絲瓜", "Bitter Gourd": "苦瓜", "Winter Melon": "冬瓜", "Pumpkin": "南瓜", "Zucchini": "櫛瓜", 
-    "Eggplant": "茄子", "Tomato": "番茄", "Okra": "秋葵", "Corn": "玉米", "Baby Corn": "玉米筍", "Carrot": "紅蘿蔔", 
-    "White Radish": "白蘿蔔", "Potato": "馬鈴薯", "Sweet Potato": "地瓜", "Taro": "芋頭", "Bamboo Shoot": "竹筍", 
-    "Water Bamboo": "筊白筍", "Asparagus": "蘆筍", "Bean Sprout": "豆芽菜", "Green Bean": "四季豆", "Edamame": "毛豆", 
-    "Shiitake": "香菇", "Enoki Mushroom": "金針菇", "King Oyster Mushroom": "杏鮑菇", "Broccoli": "花椰菜",
-    "Red Apple": "蘋果", "Banana": "香蕉", "Pineapple": "鳳梨", "Papaya": "木瓜", "Watermelon": "西瓜", "Melon": "哈密瓜", 
-    "Grape": "葡萄", "Strawberry": "草莓", "Orange": "柳丁", "Tangerine": "橘子", "Lemon": "檸檬", "Passion Fruit": "百香果", 
-    "Mango": "芒果", "Guava": "芭樂", "Pear": "水梨", "Dragon Fruit": "火龍果", "Kiwi": "奇異果", "Peach": "桃子", "Cherry": "櫻桃", 
-    
-    # 🔥 優化後的肉類對應
-    "Raw pork meat": "豬肉", "Packaged raw pork": "豬肉",
-    "Raw pork belly slice": "豬五花", 
-    "Raw pork chop": "豬排", 
-    "Sausage": "香腸", "Bacon": "培根", "Ham": "火腿", 
-    "Raw beef meat": "牛肉", "Sliced raw beef": "牛肉", "Packaged raw beef": "牛肉","Meat": "牛肉", "Beef slice": "牛肉", "Red meat": "牛肉", # 👈 新增對應
-    "Raw beef steak": "牛排", 
-    "Wagyu beef": "牛肉", "Marbled beef": "牛肉", "Raw red meat": "牛肉", # 👈 新增這行對應
-    
-    # 主食、烘焙與調味
-    "Rice": "白米", "Noodle": "麵條", "Pasta": "義大利麵", "Toast": "吐司", "Bread": "麵包", "Bun": "包子", 
-    "Dumpling": "水餃", "Egg": "雞蛋", "Tofu": "豆腐", "Dried Tofu": "豆乾", "Bean Curd Skin": "豆皮", 
-    "Milk": "牛奶", "Soy Milk": "豆漿", "Oat Milk": "燕麥奶", "Yogurt": "優格", "Cheese": "起司", "Butter": "奶油", 
-    "Soy Sauce": "醬油", "Ketchup": "番茄醬", "Kimchi": "泡菜",
-    "Flour": "麵粉", "Sugar": "砂糖", "Yeast": "酵母粉", "Baking Powder": "泡打粉", "Vanilla Extract": "香草精", 
-    "Chocolate": "巧克力", "Whipping Cream": "鮮奶油", "Cream Cheese": "奶油乳酪", "Almond Flour": "杏仁粉", "Matcha Powder": "抹茶粉",
-    "Sesame Oil": "香油", "Oyster Sauce": "蠔油", "Rice Wine": "米酒", "Star Anise": "八角", 
-    "Wood Ear Mushroom": "木耳", "Dried Shrimp": "蝦米", "Scallop": "干貝", "Fermented Black Beans": "豆豉", "Doubanjiang": "豆瓣醬",
-    "Tuna can": "鮪魚罐頭", "Kimchi can": "泡菜罐頭", "Spam": "午餐肉",
-    "Coke": "可樂", "Milk tea": "奶茶", "Udon noodle": "烏龍麵",
-    "Chicken nugget": "雞塊", "Fish ball": "魚丸"
+    "apple": "蘋果",
+    "orange": "橘子",  # 👈 你的橘子在這裡！
+    "banana": "香蕉",
+    "broccoli": "青花菜",
+    "carrot": "紅蘿蔔",
+    "sandwich": "三明治",
+    "pizza": "披薩",
+    "cake": "蛋糕",
+    "donut": "甜甜圈",
+    "hot dog": "熱狗",
+    "bottle": "瓶裝飲料",
+    "cup": "杯裝飲品",
+    "bowl": "碗裝食物"
 }
 
-# 初始化模型
-model = YOLO('yolov8l-world.pt')
-model.set_classes(custom_food_list)
+model = YOLO('yolov8n.onnx', task='detect')
+torch.set_num_threads(1)
 
 @app.route('/scan_image', methods=['POST'])
 def scan_image():
     try:
-        # 1. 接收前端傳來的 base64 圖片資料
-        data = request.json.get('image')
-        if not data:
-            return jsonify({"error": "No image data"}), 400
+        # 1. 確保有收到正確的 JSON 與圖片資料
+        json_data = request.get_json()
+        if not json_data or 'image' not in json_data:
+            print("🚨 錯誤：缺少 image 欄位或非 JSON 格式")
+            return jsonify({"error": "Missing image data"}), 400
 
-        # 2. 解析 base64 並轉換為 OpenCV 可讀取的格式
+        data = json_data['image']
+        if ',' not in data:
+            print("🚨 錯誤：圖片 Base64 格式不正確")
+            return jsonify({"error": "Invalid format"}), 400
+
+        # 2. 解析 base64 並轉換為 OpenCV 圖片
         encoded_data = data.split(',')[1]
         nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         # 3. 進行 YOLO 辨識
-        # 🔥 核彈級降維打擊：門檻降到 0.15
-        results = model(img, conf=0.15, iou=0.3)
+        # 加入 imgsz=320 強制 AI 將運算解析度降到最低，避免 512MB 記憶體爆炸
+        results = model(img, conf=0.15, iou=0.3, imgsz=320)
         inventory_count = {}
 
-        # 4. 統計辨識結果
+        # 4. 統計辨識結果 (過濾系統)
         for r in results:
             for box in r.boxes:
                 cls_idx = int(box.cls[0])
                 if cls_idx < len(custom_food_list):
                     eng_name = custom_food_list[cls_idx]
-                    # 透過字典將複雜的英文描述對應回標準中文
-                    zh_name = translation_dict.get(eng_name, eng_name)
-                    inventory_count[zh_name] = inventory_count.get(zh_name, 0) + 1
                     
-        # 5. 回傳 JSON 清單給前端
+                    # 只有在翻譯字典裡的「食物」才會被加入清單
+                    if eng_name in translation_dict:
+                        zh_name = translation_dict[eng_name]
+                        inventory_count[zh_name] = inventory_count.get(zh_name, 0) + 1
+                    
         return jsonify(inventory_count)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print("🚨 發生嚴重錯誤:", str(e))
+        print(traceback.format_exc()) 
+        return jsonify({"error": "伺服器內部錯誤", "details": str(e)}), 500
+
+# ==========================================
+# 4. 處理使用者在 LINE 傳送的文字訊息
+# ==========================================
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    user_line_id = event.source.user_id
+    user_text = event.message.text.strip()
+
+    # 檢查使用者是否已經綁定過帳號
+    bind_doc = db.collection('line_bindings').document(user_line_id).get()
+    
+    if not bind_doc.exists:
+        # 如果沒綁定，給他你的 LIFF 綁定網址！
+        # ⚠️ 記得把下面的 LIFF_ID 換成你的
+        liff_url = "https://liff.line.me/你的_LIFF_ID"
+        reply_msg = f"哈囉！你還沒有綁定食光守護者的冰箱喔！\n請點擊下方連結進行綁定：\n{liff_url}"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_msg))
+        return
+
+    firebase_uid = bind_doc.to_dict().get('firebaseUid')
+    user_doc = db.collection('users').document(firebase_uid).get()
+    
+    if not user_doc.exists:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="你的冰箱目前空空如也，快去網頁版新增食材吧！"))
+        return
+        
+    inventory = user_doc.to_dict().get('inventory', [])
+
+    # --- 關鍵字回覆邏輯 ---
+    if user_text in ["冰箱狀態", "查冰箱", "快過期的食材"]:
+        today = datetime.now().date()
+        expired_items = []
+        warning_items = []
+
+        for item in inventory:
+            # 將字串 "2026-04-25" 轉成日期物件
+            expiry_date = datetime.strptime(item.get('expiry'), "%Y-%m-%d").date()
+            diff_days = (expiry_date - today).days
+
+            if diff_days < 0:
+                expired_items.append(f"❌ {item.get('name')} (已過期)")
+            elif diff_days <= 3:
+                warning_items.append(f"⚠️ {item.get('name')} (剩 {diff_days} 天)")
+
+        # 組合回覆訊息
+        reply_lines = []
+        if not expired_items and not warning_items:
+            reply_lines.append("✨ 目前冰箱裡的食材都很新鮮喔！")
+        else:
+            if expired_items:
+                reply_lines.append("【已過期請丟棄】")
+                reply_lines.extend(expired_items)
+                reply_lines.append("")
+            if warning_items:
+                reply_lines.append("【即期品請優先食用】")
+                reply_lines.extend(warning_items)
+
+        reply_text = "\n".join(reply_lines)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+
+    elif user_text == "購物清單":
+        shopping_data = user_doc.to_dict().get('shoppingData', [])
+        unbought = [item.get('name') for item in shopping_data if not item.get('checked')]
+        
+        if unbought:
+            reply_text = "🛒 你的待買清單有：\n" + "\n".join([f"• {name}" for name in unbought])
+        else:
+            reply_text = "🛒 目前沒有待買物品喔！"
+            
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+
+    else:
+        # 使用者輸入其他文字時的預設回覆
+        reply_text = "你可以對我說：\n🔍 「冰箱狀態」\n🛒 「購物清單」"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
 if __name__ == '__main__':
-    # 啟動伺服器
     app.run(host='0.0.0.0', port=5000, debug=False)
